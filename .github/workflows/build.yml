@@ -1,0 +1,53 @@
+name: Build XiaoZhi Eyes Firmware
+
+# 用法：Actions -> Build XiaoZhi Eyes Firmware -> Run workflow
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build bread-compact-wifi (0.91寸 128x32)
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v6.1
+    steps:
+      - name: 取出补丁文件
+        uses: actions/checkout@v4
+
+      - name: 拉取上游固件源码 v2.5.2
+        run: |
+          git config --global --add safe.directory '*'
+          git clone --depth 1 --branch v2.5.2 https://github.com/78/xiaozhi-esp32.git /tmp/src
+
+      - name: 应用大眼睛补丁
+        run: |
+          set -e
+          cp oled_display.cc /tmp/src/main/display/oled_display.cc
+          cp oled_display.h  /tmp/src/main/display/oled_display.h
+          grep -q "EyesForEmotion" /tmp/src/main/display/oled_display.cc
+          grep -q "SetupEyes"      /tmp/src/main/display/oled_display.h
+          echo "补丁已应用"
+
+      - name: 编译 128x32 版本
+        shell: bash
+        run: |
+          source "$IDF_PATH/export.sh"
+          cd /tmp/src
+          python scripts/build.py bread-compact-wifi --name bread-compact-wifi --language zh-CN
+
+      - name: 收集产物
+        run: |
+          mkdir -p /tmp/out
+          ls -la /tmp/src/build/*.bin
+          cp /tmp/src/build/merged-binary.bin /tmp/out/merged-eyes-128x32.bin
+          if [ -f /tmp/src/build/xiaozhi.bin ]; then
+            cp /tmp/src/build/xiaozhi.bin /tmp/out/app-eyes-128x32.bin
+          fi
+          ls -la /tmp/out
+
+      - name: 上传固件
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-eyes-128x32
+          path: /tmp/out/*.bin
+          if-no-files-found: error
