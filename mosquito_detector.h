@@ -210,6 +210,23 @@ private:
         }
 
         const int64_t now_us = esp_timer_get_time();
+
+        // 输入健康检查：模拟麦克风输出被偏置在 VDD/2（3.3V 供电约 2048）。
+        // 引脚悬空或没接模块时直流电平会跑到 0 或 4095 附近，此时不做检测，
+        // 避免把耦合噪声当成蚊子。
+        const bool input_ok = (mean > 250.0f && mean < 3850.0f);
+        if (!input_ok) {
+            streak_ = 0;
+            track_f_ = 0.0f;
+            floor_db_ = -200.0f;  // 等输入恢复后重新学噪声底
+            static int64_t last_warn_us = 0;
+            if (now_us - last_warn_us > 10000000) {
+                last_warn_us = now_us;
+                ESP_LOGW(MOSQ_TAG, "麦克风未接或输出异常（直流 %.0f/4095），跳过检测", mean);
+            }
+            return;
+        }
+
         const float db = 10.0f * log10f(band_pow + 1e-15f);
 
         // 校准模式：快速学习噪声底，不做检测
@@ -282,12 +299,12 @@ private:
             }
         }
 
-        // 每 3 秒打一行状态，方便串口调试
+        // 每 3 秒打一行状态，方便串口调试（直流 ~2048 说明麦克风供电正常）
         static int64_t last_log_us = 0;
         if (now_us - last_log_us > 3000000) {
             last_log_us = now_us;
-            ESP_LOGI(MOSQ_TAG, "高于底噪 %.1fdB，峰值 %.0fHz，窄带度 %.2f%s",
-                     level_db, peak_f, tone_ratio, detected ? "  <<< 检出" : "");
+            ESP_LOGI(MOSQ_TAG, "直流 %.0f，高于底噪 %.1fdB，峰值 %.0fHz，窄带度 %.2f%s",
+                     mean, level_db, peak_f, tone_ratio, detected ? "  <<< 检出" : "");
         }
     }
 
