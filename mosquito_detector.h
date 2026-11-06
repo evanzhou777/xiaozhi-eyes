@@ -1,0 +1,352 @@
+#ifndef __MOSQUITO_DETECTOR_H__
+#define __MOSQUITO_DETECTOR_H__
+
+// ============================================================================
+//  蚊子雷达（Mosquito Radar）
+//
+//  原理：
+//    蚊子在飞行时翅膀振动频率约 350~800Hz，是一个窄带、频率稳定的单音。
+//    人声、风扇、空调噪声同频段内是宽带且频率跳变的。所以判据是：
+//      ① 带内能量明显高于自适应噪声底
+//      ② 峰值能量占带内总能量比例够高（窄带性，排除人声/噪声）
+//      ③ 峰值频率连续多帧稳定（排除瞬态咔哒声）
+//
+//  硬件：模拟麦克风模块（MAX4466 / MAX9814）AO -> ADC 引脚，3.3V 供电
+//        只有一路，不做方位；只回答“附近有没有蚊子”
+//
+//  隔离性：
+//    走独立 ADC 通道 + 独立低优先级任务，不碰 I2S 音频链路、不碰显示层。
+//    即使本模块初始化失败或任务异常，也只会退化为“没有这个工具”，
+//    不影响小智原有的语音、唤醒、配网、表情。
+// ============================================================================
+
+#include "mcp_server.h"
+
+#include <esp_adc/adc_continuous.h>
+#include <esp_err.h>
+#include <esp_log.h>
+#include <esp_timer.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+
+#include <atomic>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <mutex>
+#include <string>
+
+#define MOSQ_TAG "MosquitoRadar"
+
+// ---- 可调参数 --------------------------------------------------------------
+#define MOSQ_SAMPLE_RATE 16000     // 采样率 Hz
+#define MOSQ_FRAME 1024            // 每帧采样点数（64ms，频率分辨率 15.6Hz）
+#define MOSQ_FMIN 380.0f           // 检测频段下界 Hz
+#define MOSQ_FMAX 820.0f           // 检测频段上界 Hz
+#define MOSQ_MIN_LEVEL_DB 9.0f     // 需高于噪声底多少 dB
+#define MOSQ_MIN_TONE_RATIO 0.15f  // 峰值/带内总能量，低于此判为宽带噪声
+#define MOSQ_STABLE_FRAMES 4       // 连续稳定帧数（x64ms）才确认
+#define MOSQ_MAX_DRIFT 30.0f       // 帧间允许的频率漂移 Hz
+#define MOSQ_WINDOW_MS 15000       // “最近听到过”的统计窗口
+#define MOSQ_CALIB_MS 2000         // 校准时长
+
+class MosquitoDetector {
+public:
+    explicit MosquitoDetector(gpio_num_t adc_gpio) : adc_gpio_(adc_gpio) {
+        if (adc_gpio_ == GPIO_NUM_NC) {
+            ESP_LOGW(MOSQ_TAG, "未配置麦克风引脚，蚊子雷达不启用");
+            return;
+        }
+        if (!InitAdc()) {
+            return;
+        }
+        RegisterTools();
+        if (xTaskCreate(&MosquitoDetector::TaskEntry, "mosq_radar", 6144, this, 3, &task_) != pdPASS) {
+            ESP_LOGE(MOSQ_TAG, "创建分析任务失败");
+            task_ = nullptr;
+        }
+    }
+
+private:
+    gpio_num_t adc_gpio_;
+    adc_continuous_handle_t handle_ = nullptr;
+    TaskHandle_t task_ = nullptr;
+
+    // ESP32-S3 每个 ADC 采样结果是 adc_digi_output_data_t（4 字节），不是 2 字节
+    static constexpr int kResultBytes = (int)sizeof(adc_digi_output_data_t);
+    uint8_t raw_buf_[MOSQ_FRAME * (int)sizeof(adc_digi_output_data_t)] = {0};
+
+    float frame_[MOSQ_FRAME] = {0};
+    float floor_ = 0.0f;      // 自适应噪声底（带内功率）
+    float track_f_ = 0.0f;    // 跟踪中的峰值频率
+    int streak_ = 0;          // 连续符合判据的帧数
+
+    std::mutex mutex_;
+    float last_level_ = 0.0f;
+    float last_ratio_ = 0.0f;
+    float last_freq_ = 0.0f;
+    int64_t last_detect_us_ = 0;
+    float last_detect_freq_ = 0.0f;
+    float last_detect_level_ = 0.0f;
+    float last_detect_conf_ = 0.0f;
+
+    std::atomic<bool> calibrating_{false};
+    std::atomic<int64_t> calib_until_us_{0};
+
+    // ---- ADC 初始化 --------------------------------------------------------
+    bool InitAdc() {
+        adc_unit_t unit = ADC_UNIT_1;
+        adc_channel_t channel = ADC_CHANNEL_0;
+
+        esp_err_t err = adc_continuous_io_to_channel(adc_gpio_, &unit, &channel);
+        if (err != ESP_OK) {
+            ESP_LOGE(MOSQ_TAG, "GPIO%d 不是 ADC 引脚，蚊子雷达不启用", (int)adc_gpio_);
+            return false;
+        }
+        if (unit != ADC_UNIT_1) {
+            // ADC2 与 WiFi 冲突，必须用 ADC1
+            ESP_LOGE(MOSQ_TAG, "GPIO%d 属于 ADC2，WiFi 开启时不可用，请换到 ADC1 引脚", (int)adc_gpio_);
+            return false;
+        }
+
+        adc_continuous_handle_cfg_t hcfg;
+        memset(&hcfg, 0, sizeof(hcfg));
+        hcfg.max_store_buf_size = MOSQ_FRAME * kResultBytes * 4;
+        hcfg.conv_frame_size = MOSQ_FRAME * kResultBytes;
+        hcfg.flags.flush_pool = 1;
+
+        err = adc_continuous_new_handle(&hcfg, &handle_);
+        if (err != ESP_OK) {
+            ESP_LOGE(MOSQ_TAG, "adc_continuous_new_handle 失败: %s", esp_err_to_name(err));
+            return false;
+        }
+
+        adc_digi_pattern_config_t pattern;
+        memset(&pattern, 0, sizeof(pattern));
+        pattern.atten = ADC_ATTEN_DB_12;
+        pattern.channel = (uint8_t)channel;
+        pattern.unit = (uint8_t)unit;
+        pattern.bit_width = ADC_BITWIDTH_DEFAULT;
+
+        adc_continuous_config_t ccfg;
+        memset(&ccfg, 0, sizeof(ccfg));
+        ccfg.pattern_num = 1;
+        ccfg.adc_pattern = &pattern;
+        ccfg.sample_freq_hz = MOSQ_SAMPLE_RATE;
+        ccfg.conv_mode = ADC_CONV_SINGLE_UNIT_1;
+        ccfg.format = ADC_DIGI_OUTPUT_FORMAT_TYPE2;
+
+        err = adc_continuous_config(handle_, &ccfg);
+        if (err != ESP_OK) {
+            ESP_LOGE(MOSQ_TAG, "adc_continuous_config 失败: %s", esp_err_to_name(err));
+            adc_continuous_deinit(handle_);
+            handle_ = nullptr;
+            return false;
+        }
+
+        err = adc_continuous_start(handle_);
+        if (err != ESP_OK) {
+            ESP_LOGE(MOSQ_TAG, "adc_continuous_start 失败: %s", esp_err_to_name(err));
+            adc_continuous_deinit(handle_);
+            handle_ = nullptr;
+            return false;
+        }
+
+        ESP_LOGI(MOSQ_TAG, "麦克风已接 GPIO%d (ADC1_CH%d)，采样 %d Hz",
+                 (int)adc_gpio_, (int)channel, MOSQ_SAMPLE_RATE);
+
+        // 开机先静默学习 1.5 秒环境噪声，避免把电源启动噪声当成基线
+        calib_until_us_.store(esp_timer_get_time() + 1500 * 1000);
+        calibrating_.store(true);
+        return true;
+    }
+
+    // ---- Goertzel：单个频点的归一化功率 -----------------------------------
+    static float GoertzelPower(const float* x, int n, float freq) {
+        const float w = 2.0f * 3.14159265358979f * freq / (float)MOSQ_SAMPLE_RATE;
+        const float coeff = 2.0f * cosf(w);
+        float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f;
+        for (int i = 0; i < n; i++) {
+            s0 = x[i] + coeff * s1 - s2;
+            s2 = s1;
+            s1 = s0;
+        }
+        const float re = s1 - s2 * cosf(w);
+        const float im = s2 * sinf(w);
+        const float mag2 = re * re + im * im;
+        // 归一化：单音幅度 A 时 |X|=A*n/2，故 |X|^2/n^2 = A^2/4，与幅度可比的功率量
+        return mag2 / ((float)n * (float)n);
+    }
+
+    // ---- 单帧分析 ----------------------------------------------------------
+    void Analyze(const uint8_t* buf, uint32_t bytes) {
+        const int n = (int)(bytes / kResultBytes);
+        if (n != MOSQ_FRAME) {
+            return;  // 只处理完整帧，保证频率轴对齐
+        }
+        const adc_digi_output_data_t* rec = (const adc_digi_output_data_t*)buf;
+
+        // 去直流并归一化到 ±1（12bit -> ±2048）
+        float mean = 0.0f;
+        for (int i = 0; i < n; i++) {
+            mean += (float)(rec[i].val & 0x0FFF);
+        }
+        mean /= (float)n;
+
+        for (int i = 0; i < n; i++) {
+            frame_[i] = ((float)(rec[i].val & 0x0FFF) - mean) * (1.0f / 2048.0f);
+        }
+
+        // 带内扫频，记录峰值与总能量
+        const float step = (float)MOSQ_SAMPLE_RATE / (float)MOSQ_FRAME;
+        float peak_pow = 0.0f, peak_f = 0.0f, band_pow = 0.0f;
+        for (float f = MOSQ_FMIN; f <= MOSQ_FMAX + 0.01f; f += step) {
+            float p = GoertzelPower(frame_, n, f);
+            band_pow += p;
+            if (p > peak_pow) {
+                peak_pow = p;
+                peak_f = f;
+            }
+        }
+
+        const int64_t now_us = esp_timer_get_time();
+
+        // 校准模式：快速学习噪声底，不做检测
+        if (calibrating_.load()) {
+            floor_ = (floor_ <= 0.0f) ? band_pow : floor_ * 0.7f + band_pow * 0.3f;
+            if (now_us >= calib_until_us_.load()) {
+                calibrating_.store(false);
+                ESP_LOGI(MOSQ_TAG, "噪声底校准完成");
+            }
+            return;
+        }
+
+        // 首帧先建立噪声底
+        if (floor_ <= 0.0f) {
+            floor_ = band_pow + 1e-12f;
+            return;
+        }
+
+        const float level_db = 10.0f * log10f((band_pow + 1e-12f) / (floor_ + 1e-12f));
+        const float tone_ratio = (band_pow > 0.0f) ? peak_pow / band_pow : 0.0f;
+
+        const bool loud = level_db >= MOSQ_MIN_LEVEL_DB;
+        const bool tonal = tone_ratio >= MOSQ_MIN_TONE_RATIO;
+
+        if (loud && tonal) {
+            if (track_f_ <= 0.0f || fabsf(peak_f - track_f_) <= MOSQ_MAX_DRIFT) {
+                track_f_ = (track_f_ <= 0.0f) ? peak_f : track_f_ * 0.7f + peak_f * 0.3f;
+                if (streak_ < 1000) {
+                    streak_++;
+                }
+            } else {
+                // 频率跳变，重新起算
+                track_f_ = peak_f;
+                streak_ = 1;
+            }
+        } else {
+            streak_ = 0;
+            track_f_ = 0.0f;
+            // 安静时缓慢更新噪声底，适应环境变化
+            floor_ = floor_ * 0.95f + band_pow * 0.05f;
+        }
+
+        const bool detected = (streak_ >= MOSQ_STABLE_FRAMES);
+
+        float conf = 0.0f;
+        if (detected) {
+            float lv = (level_db - MOSQ_MIN_LEVEL_DB) / 15.0f;
+            if (lv < 0.0f) lv = 0.0f;
+            if (lv > 1.0f) lv = 1.0f;
+            float tr = tone_ratio / 0.5f;
+            if (tr > 1.0f) tr = 1.0f;
+            conf = 0.5f * lv + 0.5f * tr;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            last_level_ = level_db;
+            last_ratio_ = tone_ratio;
+            last_freq_ = peak_f;
+            if (detected) {
+                last_detect_us_ = now_us;
+                last_detect_freq_ = track_f_;
+                last_detect_level_ = level_db;
+                last_detect_conf_ = conf;
+            }
+        }
+
+        // 每 3 秒打一行状态，方便串口调试
+        static int64_t last_log_us = 0;
+        if (now_us - last_log_us > 3000000) {
+            last_log_us = now_us;
+            ESP_LOGI(MOSQ_TAG, "高于底噪 %.1fdB，峰值 %.0fHz，窄带度 %.2f%s",
+                     level_db, peak_f, tone_ratio, detected ? "  <<< 检出" : "");
+        }
+    }
+
+    // ---- 任务 --------------------------------------------------------------
+    static void TaskEntry(void* arg) {
+        static_cast<MosquitoDetector*>(arg)->Run();
+    }
+
+    void Run() {
+        while (true) {
+            uint32_t got = 0;
+            esp_err_t err = adc_continuous_read(handle_, raw_buf_, sizeof(raw_buf_), &got, 500);
+            if (err != ESP_OK || got == 0) {
+                vTaskDelay(pdMS_TO_TICKS(20));
+                continue;
+            }
+            Analyze(raw_buf_, got);
+        }
+    }
+
+    // ---- MCP 工具 ----------------------------------------------------------
+    void RegisterTools() {
+        auto& mcp = McpServer::GetInstance();
+
+        mcp.AddTool(
+            "self.mosquito.scan",
+            "Report whether mosquito wingbeat sound has been detected in this room in the last 15 seconds. "
+            "Returns detected flag, wingbeat frequency in Hz and confidence. "
+            "Use this when the user asks whether there are mosquitoes nearby.",
+            PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+                std::lock_guard<std::mutex> lock(mutex_);
+                const int64_t now_us = esp_timer_get_time();
+                const int64_t delta_ms =
+                    (last_detect_us_ > 0) ? (now_us - last_detect_us_) / 1000 : -1;
+                const bool recent = (delta_ms >= 0 && delta_ms <= MOSQ_WINDOW_MS);
+
+                char json[224];
+                if (!recent) {
+                    snprintf(json, sizeof(json),
+                             "{\"detected\": false, \"ambient_level_db\": %.1f, "
+                             "\"peak_frequency_hz\": %.0f}",
+                             last_level_, last_freq_);
+                } else {
+                    snprintf(json, sizeof(json),
+                             "{\"detected\": true, \"frequency_hz\": %.0f, \"level_db\": %.1f, "
+                             "\"confidence\": %.2f, \"seconds_ago\": %.1f}",
+                             last_detect_freq_, last_detect_level_, last_detect_conf_,
+                             (float)delta_ms / 1000.0f);
+                }
+                return std::string(json);
+            });
+
+        mcp.AddTool(
+            "self.mosquito.calibrate",
+            "Recalibrate the background noise floor of the mosquito detector. "
+            "Call this after the device has been moved, or when the room noise changed and the "
+            "detector keeps reporting false positives.",
+            PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+                calib_until_us_.store(esp_timer_get_time() + (int64_t)MOSQ_CALIB_MS * 1000);
+                calibrating_.store(true);
+                return true;
+            });
+
+        ESP_LOGI(MOSQ_TAG, "工具已注册：self.mosquito.scan / self.mosquito.calibrate");
+    }
+};
+
+#endif  // __MOSQUITO_DETECTOR_H__
