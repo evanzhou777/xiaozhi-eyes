@@ -1,7 +1,7 @@
-name: Build XiaoZhi Eyes Firmware
+name: Build XiaoZhi Firmware (Eyes + Mosquito Radar)
 
-# 用法：Actions -> Build XiaoZhi Eyes Firmware -> Run workflow
-# 目标：v2.5.3（main 分支 a73e9a7e）+ 全屏大眼睛 + 唤醒词「你好小鑫」
+# 用法：Actions -> Build XiaoZhi Firmware (Eyes + Mosquito Radar) -> Run workflow
+# 目标：v2.5.3（main 分支 a73e9a7e）+ 全屏大眼睛 + 蚊子雷达 + 唤醒词「你好小鑫」
 on:
   workflow_dispatch:
 
@@ -10,7 +10,7 @@ env:
 
 jobs:
   build:
-    name: Build bread-compact-wifi (128x32, 你好小鑫)
+    name: Build bread-compact-wifi (128x32, 你好小鑫, 蚊子雷达)
     runs-on: ubuntu-latest
     container:
       image: espressif/idf:v6.1
@@ -29,15 +29,35 @@ jobs:
           mv "$SRC_DIR" /tmp/upstream
           grep -n 'PROJECT_VER' /tmp/upstream/CMakeLists.txt | head -2
 
-      - name: 应用大眼睛补丁
+      - name: 应用补丁（大眼睛 + 蚊子雷达）
         run: |
           set -e
           cp oled_display.cc /tmp/upstream/main/display/oled_display.cc
           cp oled_display.h  /tmp/upstream/main/display/oled_display.h
+          cp mosquito_detector.h /tmp/upstream/main/boards/common/mosquito_detector.h
+          cp config.h /tmp/upstream/main/boards/bread-compact-wifi/config.h
+          cp compact_wifi_board.cc /tmp/upstream/main/boards/bread-compact-wifi/compact_wifi_board.cc
           grep -q "EyesForEmotion" /tmp/upstream/main/display/oled_display.cc
           grep -q "StartBlinkAnim"  /tmp/upstream/main/display/oled_display.h
           grep -q "bool OledDisplay::SetEmotion" /tmp/upstream/main/display/oled_display.cc
+          grep -q "MOSQUITO_MIC_GPIO" /tmp/upstream/main/boards/bread-compact-wifi/config.h
+          grep -q "MosquitoDetector mosquito" /tmp/upstream/main/boards/bread-compact-wifi/compact_wifi_board.cc
           echo "补丁已应用"
+
+      - name: 补上 esp_adc 组件依赖
+        run: |
+          set -e
+          cd /tmp/upstream/main
+          python3 - <<'PY'
+          s = open('CMakeLists.txt').read()
+          if 'esp_adc' not in s:
+              i = s.index('PRIV_REQUIRES')
+              j = s.index('\n', i) + 1
+              s = s[:j] + '                        esp_adc\n' + s[j:]
+              open('CMakeLists.txt', 'w').write(s)
+          print('esp_adc 已在依赖里')
+          PY
+          grep -n "esp_adc" CMakeLists.txt
 
       - name: 编译 128x32 版本
         shell: bash
@@ -54,15 +74,15 @@ jobs:
         run: |
           set -e
           mkdir -p /tmp/out
-          cp /tmp/upstream/build/merged-binary.bin /tmp/out/merged-eyes-253.bin
+          cp /tmp/upstream/build/merged-binary.bin /tmp/out/merged-radar-253.bin
           if [ -f /tmp/upstream/build/xiaozhi.bin ]; then
-            cp /tmp/upstream/build/xiaozhi.bin /tmp/out/app-eyes-253.bin
+            cp /tmp/upstream/build/xiaozhi.bin /tmp/out/app-radar-253.bin
           fi
           ls -la /tmp/out
 
       - name: 上传固件
         uses: actions/upload-artifact@v4
         with:
-          name: firmware-eyes-253
+          name: firmware-radar-253
           path: /tmp/out/*.bin
           if-no-files-found: error
