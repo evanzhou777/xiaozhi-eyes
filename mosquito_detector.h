@@ -77,7 +77,7 @@ private:
     uint8_t raw_buf_[MOSQ_FRAME * (int)sizeof(adc_digi_output_data_t)] = {0};
 
     float frame_[MOSQ_FRAME] = {0};
-    float floor_ = 0.0f;      // 自适应噪声底（带内功率）
+    float floor_db_ = -200.0f;  // 自适应噪声底（dB 域）
     float track_f_ = 0.0f;    // 跟踪中的峰值频率
     int streak_ = 0;          // 连续符合判据的帧数
 
@@ -210,24 +210,25 @@ private:
         }
 
         const int64_t now_us = esp_timer_get_time();
+        const float db = 10.0f * log10f(band_pow + 1e-15f);
 
         // 校准模式：快速学习噪声底，不做检测
         if (calibrating_.load()) {
-            floor_ = (floor_ <= 0.0f) ? band_pow : floor_ * 0.7f + band_pow * 0.3f;
+            floor_db_ = (floor_db_ < -100.0f) ? db : floor_db_ * 0.7f + db * 0.3f;
             if (now_us >= calib_until_us_.load()) {
                 calibrating_.store(false);
-                ESP_LOGI(MOSQ_TAG, "噪声底校准完成");
+                ESP_LOGI(MOSQ_TAG, "噪声底校准完成：%.1f dB", floor_db_);
             }
             return;
         }
 
         // 首帧先建立噪声底
-        if (floor_ <= 0.0f) {
-            floor_ = band_pow + 1e-12f;
+        if (floor_db_ < -100.0f) {
+            floor_db_ = db;
             return;
         }
 
-        const float level_db = 10.0f * log10f((band_pow + 1e-12f) / (floor_ + 1e-12f));
+        const float level_db = db - floor_db_;
         const float tone_ratio = (band_pow > 0.0f) ? peak_pow / band_pow : 0.0f;
 
         const bool loud = level_db >= MOSQ_MIN_LEVEL_DB;
@@ -247,8 +248,13 @@ private:
         } else {
             streak_ = 0;
             track_f_ = 0.0f;
-            // 安静时缓慢更新噪声底，适应环境变化
-            floor_ = floor_ * 0.95f + band_pow * 0.05f;
+            // 噪声底在 dB 域跟踪：变安静时跟得快，变吵时跟得慢，
+            // 避免一声蚊子把底噪抬上去之后自己反而听不见了
+            if (db < floor_db_) {
+                floor_db_ = floor_db_ * 0.90f + db * 0.10f;
+            } else {
+                floor_db_ = floor_db_ * 0.999f + db * 0.001f;
+            }
         }
 
         const bool detected = (streak_ >= MOSQ_STABLE_FRAMES);
