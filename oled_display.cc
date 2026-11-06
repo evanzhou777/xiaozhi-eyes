@@ -59,6 +59,20 @@ void EyeBlinkAnimCb(void* var, int32_t value) {
     static_cast<OledDisplay*>(var)->SetEyeScale(static_cast<int>(value));
 }
 
+// 按下发的「睁开度」摆一只眼睛：高度变化、垂直居中、圆角取短边一半
+void ShapeEye(lv_obj_t* eye, int w, int h, int x, int y, int scale, int blink) {
+    if (eye == nullptr) {
+        return;
+    }
+    int hh = h * scale * blink / 10000;
+    if (hh < 2) hh = 2;
+    int maxh = h + h / 5;
+    if (hh > maxh) hh = maxh;
+    lv_obj_set_size(eye, w, hh);
+    lv_obj_set_pos(eye, x, y + (h - hh) / 2);
+    lv_obj_set_style_radius(eye, std::min(w, hh) / 2, 0);
+}
+
 }  // namespace
 
 OledDisplay::OledDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_t panel,
@@ -204,6 +218,8 @@ void OledDisplay::SetChatMessage(const char* role, const char* content) {
     lv_anim_delete(chat_message_label_, nullptr);
     if (content_right_ == nullptr) {
         lv_label_set_text(chat_message_label_, content_str.c_str());
+        has_chat_text_ = !(content == nullptr || content[0] == '\0');
+        UpdateLayoutMode();
     } else {
         if (content == nullptr || content[0] == '\0') {
             lv_obj_add_flag(content_right_, LV_OBJ_FLAG_HIDDEN);
@@ -218,6 +234,8 @@ void OledDisplay::SetChatMessage(const char* role, const char* content) {
                 lv_obj_add_flag(content_left_, LV_OBJ_FLAG_HIDDEN);
             }
         }
+        has_chat_text_ = !(content == nullptr || content[0] == '\0');
+        UpdateLayoutMode();
     }
 }
 
@@ -382,9 +400,13 @@ void OledDisplay::SetupUI_128x32() {
     lv_obj_set_style_border_width(content_, 0, 0);
     lv_obj_set_style_radius(content_, 0, 0);
 
-    /* 大眼睛：左侧 32x32 区域就是眼睛舞台 */
+    /* 说话时：左侧 32x32 区域放一对小眼睛，右边滚字幕 */
     SetupEyes(content_);
     (void)large_icon_font;
+
+    /* 待机时：全屏大眼睛，盖在 container_ 之上 */
+    SetupFullScreenEyes(screen);
+    UpdateLayoutMode();
 
     /* Right side */
     side_bar_ = lv_obj_create(container_);
@@ -478,7 +500,7 @@ void OledDisplay::SetupEyes(lv_obj_t* parent) {
         return;
     }
     if (height_ <= 32) {
-        // 0.91 寸 128x32：塞满左侧 32x32 区域
+        // 说话时左侧 32x32 里的小眼睛
         eye_w_ = 11;
         eye_h_ = 20;
         eye_gap_ = 7;
@@ -491,6 +513,7 @@ void OledDisplay::SetupEyes(lv_obj_t* parent) {
 
     eyes_area_ = lv_obj_create(parent);
     lv_obj_remove_style_all(eyes_area_);
+    lv_obj_clear_flag(eyes_area_, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_size(eyes_area_, eye_w_ * 2 + eye_gap_, eye_h_);
     lv_obj_set_style_bg_opa(eyes_area_, LV_OPA_TRANSP, 0);
     lv_obj_add_flag(eyes_area_, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
@@ -498,11 +521,13 @@ void OledDisplay::SetupEyes(lv_obj_t* parent) {
 
     eye_left_ = lv_obj_create(eyes_area_);
     lv_obj_remove_style_all(eye_left_);
+    lv_obj_clear_flag(eye_left_, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_bg_color(eye_left_, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(eye_left_, LV_OPA_COVER, 0);
 
     eye_right_ = lv_obj_create(eyes_area_);
     lv_obj_remove_style_all(eye_right_);
+    lv_obj_clear_flag(eye_right_, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_bg_color(eye_right_, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(eye_right_, LV_OPA_COVER, 0);
 
@@ -521,24 +546,66 @@ void OledDisplay::SetupEyes(lv_obj_t* parent) {
         3000, this);
 }
 
-void OledDisplay::ApplyEyeShape() {
-    if (eye_left_ == nullptr || eye_right_ == nullptr) {
-        return;
+void OledDisplay::SetupFullScreenEyes(lv_obj_t* parent) {
+    if (parent == nullptr || height_ > 32) {
+        return;  // 只有 128x32 做全屏眼睛
     }
-    int hl = eye_h_ * eye_scale_l_ * blink_pct_ / 10000;
-    int hr = eye_h_ * eye_scale_r_ * blink_pct_ / 10000;
-    if (hl < 2) hl = 2;
-    if (hr < 2) hr = 2;
-    if (hl > eye_h_ + eye_h_ / 5) hl = eye_h_ + eye_h_ / 5;
-    if (hr > eye_h_ + eye_h_ / 5) hr = eye_h_ + eye_h_ / 5;
 
-    lv_obj_set_size(eye_left_, eye_w_, hl);
-    lv_obj_set_pos(eye_left_, 0, (eye_h_ - hl) / 2);
-    lv_obj_set_style_radius(eye_left_, std::min(eye_w_, hl) / 2, 0);
+    eyes_full_ = lv_obj_create(parent);
+    lv_obj_remove_style_all(eyes_full_);
+    lv_obj_clear_flag(eyes_full_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(eyes_full_, LV_HOR_RES, LV_VER_RES);
+    lv_obj_set_pos(eyes_full_, 0, 0);
+    lv_obj_set_style_bg_opa(eyes_full_, LV_OPA_TRANSP, 0);
 
-    lv_obj_set_size(eye_right_, eye_w_, hr);
-    lv_obj_set_pos(eye_right_, eye_w_ + eye_gap_, (eye_h_ - hr) / 2);
-    lv_obj_set_style_radius(eye_right_, std::min(eye_w_, hr) / 2, 0);
+    eye_f_l_ = lv_obj_create(eyes_full_);
+    lv_obj_remove_style_all(eye_f_l_);
+    lv_obj_clear_flag(eye_f_l_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_color(eye_f_l_, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(eye_f_l_, LV_OPA_COVER, 0);
+
+    eye_f_r_ = lv_obj_create(eyes_full_);
+    lv_obj_remove_style_all(eye_f_r_);
+    lv_obj_clear_flag(eye_f_r_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_color(eye_f_r_, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(eye_f_r_, LV_OPA_COVER, 0);
+
+    ApplyEyeShape();
+}
+
+void OledDisplay::ApplyEyeShape() {
+    // 小眼睛（128x64 的左栏 / 128x32 说话时的左 32px）
+    if (eye_left_ != nullptr) {
+        ShapeEye(eye_left_, eye_w_, eye_h_, 0, 0, eye_scale_l_, blink_pct_);
+    }
+    if (eye_right_ != nullptr) {
+        ShapeEye(eye_right_, eye_w_, eye_h_, eye_w_ + eye_gap_, 0, eye_scale_r_, blink_pct_);
+    }
+
+    // 全屏大眼睛
+    if (eye_f_l_ != nullptr && eye_f_r_ != nullptr) {
+        int area_w = eye_f_w_ * 2 + eye_f_gap_;
+        int ox = (LV_HOR_RES - area_w) / 2;
+        int oy = (LV_VER_RES - eye_f_h_) / 2;
+        ShapeEye(eye_f_l_, eye_f_w_, eye_f_h_, ox, oy, eye_scale_l_, blink_pct_);
+        ShapeEye(eye_f_r_, eye_f_w_, eye_f_h_, ox + eye_f_w_ + eye_f_gap_, oy, eye_scale_r_,
+                 blink_pct_);
+    }
+}
+
+void OledDisplay::UpdateLayoutMode() {
+    if (eyes_full_ == nullptr || container_ == nullptr) {
+        return;  // 128x64 不走这套
+    }
+    if (has_chat_text_) {
+        // 有字幕：显示状态栏 + 文字，收起全屏眼睛
+        lv_obj_add_flag(eyes_full_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(container_, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        // 待机：整屏都是眼睛
+        lv_obj_remove_flag(eyes_full_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(container_, LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 void OledDisplay::SetEyeScale(int percent) {
@@ -549,7 +616,7 @@ void OledDisplay::SetEyeScale(int percent) {
 }
 
 void OledDisplay::StartBlinkAnim() {
-    if (eye_left_ == nullptr) {
+    if (eye_left_ == nullptr && eye_f_l_ == nullptr) {
         return;
     }
     lv_anim_t a;
