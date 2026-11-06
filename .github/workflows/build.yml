@@ -1,12 +1,16 @@
 name: Build XiaoZhi Eyes Firmware
 
 # 用法：Actions -> Build XiaoZhi Eyes Firmware -> Run workflow
+# 目标：v2.5.3（main 分支 a73e9a7e）+ 全屏大眼睛 + 唤醒词「你好小鑫」
 on:
   workflow_dispatch:
 
+env:
+  UPSTREAM_SHA: a73e9a7e266e3196d1368ba46c30bee0d81f0a64
+
 jobs:
   build:
-    name: Build bread-compact-wifi (0.91寸 128x32)
+    name: Build bread-compact-wifi (128x32, 你好小鑫)
     runs-on: ubuntu-latest
     container:
       image: espressif/idf:v6.1
@@ -14,40 +18,51 @@ jobs:
       - name: 取出补丁文件
         uses: actions/checkout@v4
 
-      - name: 拉取上游固件源码 v2.5.2
+      - name: 拉取上游源码 v2.5.3
         run: |
-          git config --global --add safe.directory '*'
-          git clone --depth 1 --branch v2.5.2 https://github.com/78/xiaozhi-esp32.git /tmp/src
+          set -e
+          curl -sL --retry 3 --max-time 300 \
+            "https://codeload.github.com/78/xiaozhi-esp32/zip/$UPSTREAM_SHA" -o /tmp/src.zip
+          mkdir -p /tmp/src
+          unzip -q /tmp/src.zip -d /tmp/src
+          SRC_DIR=$(ls -d /tmp/src/*/ | head -1)
+          mv "$SRC_DIR" /tmp/upstream
+          grep -n 'PROJECT_VER' /tmp/upstream/CMakeLists.txt | head -2
 
       - name: 应用大眼睛补丁
         run: |
           set -e
-          cp oled_display.cc /tmp/src/main/display/oled_display.cc
-          cp oled_display.h  /tmp/src/main/display/oled_display.h
-          grep -q "EyesForEmotion" /tmp/src/main/display/oled_display.cc
-          grep -q "SetupEyes"      /tmp/src/main/display/oled_display.h
+          cp oled_display.cc /tmp/upstream/main/display/oled_display.cc
+          cp oled_display.h  /tmp/upstream/main/display/oled_display.h
+          grep -q "EyesForEmotion" /tmp/upstream/main/display/oled_display.cc
+          grep -q "StartBlinkAnim"  /tmp/upstream/main/display/oled_display.h
+          grep -q "bool OledDisplay::SetEmotion" /tmp/upstream/main/display/oled_display.cc
           echo "补丁已应用"
 
       - name: 编译 128x32 版本
         shell: bash
         run: |
           source "$IDF_PATH/export.sh"
-          cd /tmp/src
-          python scripts/build.py bread-compact-wifi --name bread-compact-wifi --language zh-CN
+          cd /tmp/upstream
+          python scripts/build.py bread-compact-wifi \
+            --name bread-compact-wifi \
+            --language zh-CN \
+            --wake-word wn9_nihaoxiaoxin_tts
+          ls -la build/*.bin
 
       - name: 收集产物
         run: |
+          set -e
           mkdir -p /tmp/out
-          ls -la /tmp/src/build/*.bin
-          cp /tmp/src/build/merged-binary.bin /tmp/out/merged-eyes-128x32.bin
-          if [ -f /tmp/src/build/xiaozhi.bin ]; then
-            cp /tmp/src/build/xiaozhi.bin /tmp/out/app-eyes-128x32.bin
+          cp /tmp/upstream/build/merged-binary.bin /tmp/out/merged-eyes-253.bin
+          if [ -f /tmp/upstream/build/xiaozhi.bin ]; then
+            cp /tmp/upstream/build/xiaozhi.bin /tmp/out/app-eyes-253.bin
           fi
           ls -la /tmp/out
 
       - name: 上传固件
         uses: actions/upload-artifact@v4
         with:
-          name: firmware-eyes-128x32
+          name: firmware-eyes-253
           path: /tmp/out/*.bin
           if-no-files-found: error
