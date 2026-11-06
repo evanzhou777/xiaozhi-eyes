@@ -49,13 +49,15 @@ jobs:
           set -e
           cd /tmp/upstream/main
           python3 - <<'PY'
+          import re
           s = open('CMakeLists.txt').read()
           if 'esp_adc' not in s:
-              i = s.index('PRIV_REQUIRES')
+              m = re.search(r'idf_component_register\(', s)
+              i = s.index('PRIV_REQUIRES', m.end())
               j = s.index('\n', i) + 1
               s = s[:j] + '                        esp_adc\n' + s[j:]
               open('CMakeLists.txt', 'w').write(s)
-          print('esp_adc 已在依赖里')
+          print('esp_adc ok')
           PY
           grep -n "esp_adc" CMakeLists.txt
 
