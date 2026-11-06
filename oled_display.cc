@@ -239,6 +239,26 @@ void OledDisplay::SetChatMessage(const char* role, const char* content) {
     }
 }
 
+void OledDisplay::RemoveChatMessage(const char* role, const char* content) {
+    DisplayLockGuard lock(this);
+    if (chat_message_label_ == nullptr || content == nullptr) {
+        return;
+    }
+    // OLED has one text slot and does not distinguish message roles.
+    std::string content_str = content;
+    std::replace(content_str.begin(), content_str.end(), '\n', ' ');
+    if (content_str != lv_label_get_text(chat_message_label_)) {
+        return;
+    }
+    lv_anim_delete(chat_message_label_, nullptr);
+    lv_label_set_text(chat_message_label_, "");
+    if (content_right_ != nullptr) {
+        lv_obj_add_flag(content_right_, LV_OBJ_FLAG_HIDDEN);
+    }
+    has_chat_text_ = false;
+    UpdateLayoutMode();
+}
+
 void OledDisplay::SetupUI_128x64() {
     DisplayLockGuard lock(this);
 
@@ -465,13 +485,14 @@ void OledDisplay::SetupUI_128x32() {
                                    LV_PART_MAIN);
 }
 
-void OledDisplay::SetEmotion(const char* emotion) {
+bool OledDisplay::SetEmotion(const char* emotion) {
     // 大眼睛模式：表情体现为眼睛的睁开度与左右不对称
     auto shape = EyesForEmotion(emotion);
     DisplayLockGuard lock(this);
     eye_scale_l_ = shape.left;
     eye_scale_r_ = shape.right;
     ApplyEyeShape();
+    return true;
 }
 
 void OledDisplay::SetTheme(Theme* theme) {
