@@ -126,7 +126,7 @@ private:
         pattern.atten = ADC_ATTEN_DB_12;
         pattern.channel = (uint8_t)channel;
         pattern.unit = (uint8_t)unit;
-        pattern.bit_width = ADC_BITWIDTH_DEFAULT;
+        pattern.bit_width = ADC_BITWIDTH_12;  // 连续模式要求显式位宽，DEFAULT 会被拒
 
         adc_continuous_config_t ccfg;
         memset(&ccfg, 0, sizeof(ccfg));
