@@ -33,8 +33,19 @@ private:
     int eye_scale_r_ = 100;
     int blink_pct_ = 100;
 
+    // ---- 全屏大眼睛（仅 128x32 待机时） ----
+    lv_obj_t* eyes_full_ = nullptr;
+    lv_obj_t* eye_f_l_ = nullptr;
+    lv_obj_t* eye_f_r_ = nullptr;
+    int eye_f_w_ = 40;
+    int eye_f_h_ = 26;
+    int eye_f_gap_ = 30;
+    bool has_chat_text_ = false;
+
     void SetupEyes(lv_obj_t* parent);
+    void SetupFullScreenEyes(lv_obj_t* parent);
     void ApplyEyeShape();
+    void UpdateLayoutMode();
 
     virtual bool Lock(int timeout_ms = 0) override;
     virtual void Unlock() override;
