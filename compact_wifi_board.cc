@@ -8,10 +8,13 @@
 #include "mcp_server.h"
 #include "lamp_controller.h"
 #include "mosquito_detector.h"
+#include "roast_sounds.h"
 #include "led/single_led.h"
 #include "assets/lang_config.h"
 
 #include <esp_log.h>
+#include <esp_random.h>
+#include <esp_timer.h>
 #include <driver/i2c_master.h>
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_panel_vendor.h>
@@ -32,6 +35,8 @@ private:
     Button touch_button_;
     Button volume_up_button_;
     Button volume_down_button_;
+    int64_t last_roast_time_us_ = 0;
+    size_t last_roast_index_ = ROAST_SOUND_COUNT;  // 初始为无效值，保证第一次不会触发避重
 
     void InitializeDisplayI2c() {
         i2c_master_bus_config_t bus_config = {
@@ -101,14 +106,43 @@ private:
         display_ = new OledDisplay(panel_io_, panel_, DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
     }
 
+    // 双击 BOOT 触发一句本地音效，完全绕开大模型与云端
+    // 只在 Idle 时播放，避免和 TTS 音频通道打架
+    void PlayRandomRoast() {
+        auto& app = Application::GetInstance();
+        if (app.GetDeviceState() != kDeviceStateIdle) {
+            ESP_LOGW(TAG, "Roast skipped: device busy (state=%d)", static_cast<int>(app.GetDeviceState()));
+            return;
+        }
+        size_t index = esp_random() % ROAST_SOUND_COUNT;
+        if (ROAST_SOUND_COUNT > 1 && index == last_roast_index_) {
+            index = (index + 1) % ROAST_SOUND_COUNT;
+        }
+        last_roast_index_ = index;
+        auto sound = ROAST_SOUNDS[index];
+        ESP_LOGI(TAG, "Roast #%u (%u bytes)", static_cast<unsigned>(index), static_cast<unsigned>(sound.size()));
+        // 排进主任务执行，按钮回调里不做阻塞式解码
+        app.Schedule([sound]() {
+            Application::GetInstance().PlaySound(sound);
+        });
+    }
+
     void InitializeButtons() {
         boot_button_.OnClick([this]() {
+            // 双击时部分 iot_button 版本仍会补发单击，这里做 800ms 去抖
+            if (esp_timer_get_time() - last_roast_time_us_ < 800000) {
+                return;
+            }
             auto& app = Application::GetInstance();
             if (app.GetDeviceState() == kDeviceStateStarting) {
                 EnterWifiConfigMode();
                 return;
             }
             app.ToggleChatState();
+        });
+        boot_button_.OnDoubleClick([this]() {
+            last_roast_time_us_ = esp_timer_get_time();
+            PlayRandomRoast();
         });
         touch_button_.OnPressDown([this]() {
             Application::GetInstance().StartListening();
