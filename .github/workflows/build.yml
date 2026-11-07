@@ -2,6 +2,7 @@ name: Build XiaoZhi Firmware (Eyes + Mosquito Radar)
 
 # 用法：Actions -> Build XiaoZhi Firmware (Eyes + Mosquito Radar) -> Run workflow
 # 目标：v2.5.3（main 分支 a73e9a7e）+ 全屏大眼睛 + 蚊子雷达 + 唤醒词「你好小鑫」
+#       + BOOT 双击随机播放 7 条本地 Ogg/Opus 音效（编译进 app，不占 assets 分区）
 on:
   workflow_dispatch:
 
@@ -35,6 +36,7 @@ jobs:
           cp oled_display.cc /tmp/upstream/main/display/oled_display.cc
           cp oled_display.h  /tmp/upstream/main/display/oled_display.h
           cp mosquito_detector.h /tmp/upstream/main/boards/common/mosquito_detector.h
+          cp roast_sounds.h /tmp/upstream/main/boards/common/roast_sounds.h
           cp config.h /tmp/upstream/main/boards/bread-compact-wifi/config.h
           cp compact_wifi_board.cc /tmp/upstream/main/boards/bread-compact-wifi/compact_wifi_board.cc
           grep -q "EyesForEmotion" /tmp/upstream/main/display/oled_display.cc
@@ -42,7 +44,9 @@ jobs:
           grep -q "bool OledDisplay::SetEmotion" /tmp/upstream/main/display/oled_display.cc
           grep -q "MOSQUITO_MIC_GPIO" /tmp/upstream/main/boards/bread-compact-wifi/config.h
           grep -q "MosquitoDetector mosquito" /tmp/upstream/main/boards/bread-compact-wifi/compact_wifi_board.cc
-          echo "补丁已应用"
+          grep -q "ROAST_SOUND_COUNT" /tmp/upstream/main/boards/common/roast_sounds.h
+          grep -q "PlayRandomRoast" /tmp/upstream/main/boards/bread-compact-wifi/compact_wifi_board.cc
+          echo "补丁已应用（含 7 条本地音效）"
 
       - name: 补上 esp_adc 组件依赖
         run: |
