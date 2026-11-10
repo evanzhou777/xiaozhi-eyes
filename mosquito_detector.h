@@ -21,6 +21,8 @@
 // ============================================================================
 
 #include "mcp_server.h"
+#include "application.h"
+#include "mosquito_alert.h"
 
 #include <esp_adc/adc_continuous.h>
 #include <esp_err.h>
@@ -35,6 +37,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #define MOSQ_TAG "MosquitoRadar"
 
@@ -49,6 +52,12 @@
 #define MOSQ_MAX_DRIFT 30.0f       // 帧间允许的频率漂移 Hz
 #define MOSQ_WINDOW_MS 15000       // “最近听到过”的统计窗口
 #define MOSQ_CALIB_MS 2000         // 校准时长
+
+// 守望模式：ADC 本来就一直在采样，这里只控制「检出后要不要主动提醒」
+#define MOSQ_ALERT_COOLDOWN_MS 60000  // 两次提醒最小间隔，防止连环误报
+#define MOSQ_ALERT_SHOW_MS 10000      // 屏幕提示保留时长
+#define MOSQ_ALERT_RETRY_MS 2000      // 设备忙（听/说）时的重试间隔
+#define MOSQ_WATCH_DEFAULT_MIN 30     // 默认守望时长，0 = 一直盯到显式关闭
 
 class MosquitoDetector {
 public:
@@ -92,6 +101,15 @@ private:
 
     std::atomic<bool> calibrating_{false};
     std::atomic<int64_t> calib_until_us_{0};
+
+    // 守望状态（ADC 任务与 MCP 主任务共享，全部用 atomic）
+    std::atomic<bool> watch_enabled_{false};
+    std::atomic<int64_t> watch_until_us_{0};  // 0 = 不限时
+    std::atomic<int64_t> last_alert_us_{0};
+    std::atomic<int64_t> alert_clear_us_{0};
+    std::atomic<int64_t> last_retry_us_{0};
+    std::atomic<bool> alert_pending_{false};
+    std::atomic<float> alert_freq_{0.0f};
 
     // ---- ADC 初始化 --------------------------------------------------------
     bool InitAdc() {
@@ -299,6 +317,53 @@ private:
             }
         }
 
+        // ---- 守望模式：检出后主动提醒 --------------------------------------
+        // 注意：本函数跑在独立的 ADC 任务里，所有 UI / 音频操作必须经
+        // Application::Schedule 排到主任务，且只在 Idle 时执行，避免抢 TTS 通道。
+        if (watch_enabled_.load()) {
+            const int64_t until = watch_until_us_.load();
+            if (until > 0 && now_us >= until) {
+                watch_enabled_.store(false);
+                alert_pending_.store(false);
+                ESP_LOGI(MOSQ_TAG, "守望结束：已到设定时长");
+            }
+        }
+
+        if (watch_enabled_.load() && detected &&
+            now_us - last_alert_us_.load() >= (int64_t)MOSQ_ALERT_COOLDOWN_MS * 1000) {
+            alert_freq_.store(track_f_);
+            alert_pending_.store(true);
+            ESP_LOGI(MOSQ_TAG, "守望命中：%.0fHz，安排提醒", track_f_);
+        }
+
+        if (alert_pending_.load() &&
+            now_us - last_retry_us_.load() >= (int64_t)MOSQ_ALERT_RETRY_MS * 1000) {
+            last_retry_us_.store(now_us);
+            alert_pending_.store(false);
+            last_alert_us_.store(now_us);
+            const float freq = alert_freq_.load();
+            Application::GetInstance().Schedule([this, freq]() {
+                auto& app = Application::GetInstance();
+                if (app.GetDeviceState() != kDeviceStateIdle) {
+                    alert_pending_.store(true);  // 正在听/说，稍后重试
+                    return;
+                }
+                char msg[96];
+                snprintf(msg, sizeof(msg), "发现蚊子 %.0fHz", freq);
+                app.Alert("蚊子警报", msg, "surprised", MOSQUITO_ALERT_SOUND);
+                alert_clear_us_.store(esp_timer_get_time() +
+                                      (int64_t)MOSQ_ALERT_SHOW_MS * 1000);
+                ESP_LOGI(MOSQ_TAG, "已主动提醒：%s", msg);
+            });
+        }
+
+        if (alert_clear_us_.load() > 0 && now_us >= alert_clear_us_.load()) {
+            alert_clear_us_.store(0);
+            Application::GetInstance().Schedule([]() {
+                Application::GetInstance().DismissAlert();
+            });
+        }
+
         // 每 3 秒打一行状态，方便串口调试（直流 ~2048 说明麦克风供电正常）
         static int64_t last_log_us = 0;
         if (now_us - last_log_us > 3000000) {
@@ -368,7 +433,50 @@ private:
                 return true;
             });
 
-        ESP_LOGI(MOSQ_TAG, "工具已注册：self.mosquito.scan / self.mosquito.calibrate");
+        // 守望开关：ADC 一直采样，这里决定「检出后是否主动提醒用户」
+        mcp.AddTool(
+            "self.mosquito.watch",
+            "Start or stop proactive mosquito watching. The microphone is always being "
+            "analysed; while watching is on, the device itself alerts the user with a screen "
+            "message and an alert sound as soon as a mosquito wingbeat is confirmed, without "
+            "the user needing to ask again. "
+            "Call enabled=true when the user says 帮我盯着蚊子 / 有蚊子提醒我 / 持续监测蚊子 / "
+            "睡觉时帮我看着蚊子 / 别让蚊子咬我 / keep watch for mosquitoes and alert me. "
+            "Call enabled=false when the user says 别盯了 / 停止监测 / 不用提醒了 / 取消蚊子警报. "
+            "minutes=0 means keep watching until explicitly stopped; default is 30 minutes.",
+            PropertyList(std::vector<Property>{
+                Property("enabled", kPropertyTypeBoolean, true),
+                Property("minutes", kPropertyTypeInteger, MOSQ_WATCH_DEFAULT_MIN, 0, 1440),
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                const bool enabled = properties["enabled"].value<bool>();
+                const int minutes = properties["minutes"].value<int>();
+                const int64_t now = esp_timer_get_time();
+                char json[192];
+                if (!enabled) {
+                    watch_enabled_.store(false);
+                    watch_until_us_.store(0);
+                    alert_pending_.store(false);
+                    alert_clear_us_.store(0);
+                    ESP_LOGI(MOSQ_TAG, "守望已关闭");
+                    snprintf(json, sizeof(json),
+                             "{\"watching\": false, \"message\": \"已停止蚊子监测\"}");
+                } else {
+                    watch_until_us_.store(minutes == 0 ? 0 : now + (int64_t)minutes * 60 * 1000000);
+                    watch_enabled_.store(true);
+                    // 重新学 1.2 秒环境底噪，避免搬动设备后旧基线造成误报
+                    calib_until_us_.store(now + 1200000);
+                    calibrating_.store(true);
+                    ESP_LOGI(MOSQ_TAG, "守望已开启：%d 分钟（0=不限时）", minutes);
+                    snprintf(json, sizeof(json),
+                             "{\"watching\": true, \"minutes\": %d, "
+                             "\"message\": \"已开始持续监测，发现蚊子会主动提醒\"}",
+                             minutes);
+                }
+                return std::string(json);
+            });
+
+        ESP_LOGI(MOSQ_TAG, "工具已注册：scan / calibrate / watch");
     }
 };
 
