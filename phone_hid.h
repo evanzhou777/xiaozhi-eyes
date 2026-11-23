@@ -12,6 +12,11 @@
 //    iOS 不允许第三方 App 在后台模拟系统级按键；标准 HID 键盘是系统原生支持的
 //    通道，不需要在手机装任何东西。
 //
+//  开关（语音）：
+//    "断开手机" -> self.phone.disconnect：停广播 + 断开 iPhone，手机遥控暂时失效
+//    "连上手机" -> self.phone.connect：重新开广播，iPhone 自动回连或需在设置里点连接
+//    关闭状态不会被掉电清除；每次开机默认开启（跟之前行为一致）。
+//
 //  隔离性：
 //    只开 BLE（S3 没有经典蓝牙），不碰 I2S / WiFi / 显示 / 现有按键。
 //    初始化失败只会让这几个工具不可用，不影响小智原有功能。
@@ -141,6 +146,11 @@ public:
         return ready_ && dev_ != nullptr && esp_hidd_dev_connected(dev_);
     }
 
+    // 只有「开关已打开」且「手机真的连着」时才允许发按键
+    bool CanControl() const {
+        return enabled_ && IsConnected();
+    }
+
     static const char* PairingCode() { return "123456"; }
 
 private:
@@ -148,6 +158,8 @@ private:
     esp_hidd_dev_t* dev_ = nullptr;
     bool ready_ = false;
     volatile bool adv_data_set_ = false;
+    volatile bool enabled_ = true;      // 语音开关：断开手机时置 false
+    volatile bool adv_running_ = false; // 由 ADV_START/STOP_COMPLETE 事件维护
 
     // ---- 键盘字符映射 ------------------------------------------------------
     // 只支持 ASCII，中文请用语音让小智自己说，不要走键盘输入
@@ -226,9 +238,27 @@ private:
     static void GapCallback(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t* param) {
         switch (event) {
             case ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT:
-                if (instance_ != nullptr) instance_->adv_data_set_ = true;
-                ESP_LOGI(PHONE_HID_TAG, "广播数据已设置，开始广播 %s", PHONE_HID_NAME);
-                esp_ble_gap_start_advertising(&instance_->adv_params_);
+                if (instance_ != nullptr) {
+                    instance_->adv_data_set_ = true;
+                    if (instance_->enabled_) {
+                        ESP_LOGI(PHONE_HID_TAG, "广播数据已设置，开始广播 %s", PHONE_HID_NAME);
+                        esp_ble_gap_start_advertising(&instance_->adv_params_);
+                    }
+                }
+                break;
+            case ESP_GAP_BLE_ADV_START_COMPLETE_EVT:
+                if (instance_ != nullptr) {
+                    instance_->adv_running_ =
+                        (param->adv_start_cmpl.status == ESP_BT_STATUS_SUCCESS);
+                    ESP_LOGI(PHONE_HID_TAG, "广播启动%s",
+                             instance_->adv_running_ ? "成功" : "失败");
+                }
+                break;
+            case ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT:
+                if (instance_ != nullptr) {
+                    instance_->adv_running_ = false;
+                    ESP_LOGI(PHONE_HID_TAG, "广播已停止（手机遥控关闭）");
+                }
                 break;
             case ESP_GAP_BLE_AUTH_CMPL_EVT:
                 if (param->ble_security.auth_cmpl.success) {
@@ -253,8 +283,16 @@ private:
                 ESP_LOGI(PHONE_HID_TAG, "iPhone 已连接，手机遥控就绪");
                 break;
             case ESP_HIDD_DISCONNECT_EVENT: {
-                ESP_LOGI(PHONE_HID_TAG, "iPhone 断开，重新开始广播");
-                esp_ble_gap_start_advertising(&instance_->adv_params_);
+                ESP_LOGI(PHONE_HID_TAG, "iPhone 断开（reason=%d）",
+                         event_data != nullptr
+                             ? ((esp_hidd_event_data_t*)event_data)->disconnect.reason : -1);
+                // 只有开关处于「开」才自动恢复广播；语音断开时不能回连
+                if (instance_ != nullptr && instance_->enabled_) {
+                    ESP_LOGI(PHONE_HID_TAG, "重新开始广播，等待 iPhone 回连");
+                    esp_ble_gap_start_advertising(&instance_->adv_params_);
+                } else {
+                    ESP_LOGI(PHONE_HID_TAG, "手机遥控已关闭，不恢复广播");
+                }
                 break;
             }
             default:
@@ -384,6 +422,68 @@ private:
         .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
     };
 
+    // ---- 语音开关：断开 / 重连 ----------------------------------------------
+    // 关：停广播 + 按绑定地址断链。绑定信息保留，重新开广播后 iPhone 不用重新配对。
+    std::string DisconnectPhone() {
+        if (!ready_) return "手机遥控没有初始化成功，无需断开";
+        if (!enabled_) return "{\"ok\": true, \"enabled\": false, \"hint\": \"手机遥控已经是关闭的\"}";
+
+        // 必须先关开关，否则 DISCONNECT 回调会自动重启广播导致立刻回连
+        enabled_ = false;
+        esp_err_t ret = esp_ble_gap_stop_advertising();
+        ESP_LOGI(PHONE_HID_TAG, "语音断开：停广播 ret=%s", esp_err_to_name(ret));
+
+        if (!IsConnected()) {
+            return "{\"ok\": true, \"enabled\": false, \"was_connected\": false, "
+                   "\"hint\": \"手机遥控已关闭，不会回连。说「连上手机」重新开启\"}";
+        }
+
+        int count = esp_ble_get_bond_device_num();
+        if (count > 0) {
+            // 静态数组：避免在这个任务栈上压一大块 bond key 结构（内部 SRAM 紧张）
+            static esp_ble_bond_dev_t bond_list[4];
+            if (count > 4) count = 4;
+            esp_err_t err = esp_ble_get_bond_device_list(&count, bond_list);
+            if (err == ESP_OK) {
+                for (int i = 0; i < count; ++i) {
+                    esp_ble_gap_disconnect(bond_list[i].bd_addr);
+                }
+            } else {
+                ESP_LOGW(PHONE_HID_TAG, "读取绑定设备失败: %s", esp_err_to_name(err));
+            }
+        } else {
+            ESP_LOGW(PHONE_HID_TAG, "已连接但没有绑定记录，无法主动断链");
+        }
+        return "{\"ok\": true, \"enabled\": false, \"was_connected\": true, "
+               "\"hint\": \"正在断开 iPhone 并停止广播。说「连上手机」重新开启\"}";
+    }
+
+    // 开：恢复广播。iPhone 通常会自动回连；若没动，可以让用户在蓝牙设置里点一下。
+    std::string ConnectPhone() {
+        if (!ready_) return "手机遥控没有初始化成功，暂时无法连接";
+
+        if (IsConnected()) {
+            enabled_ = true;
+            return "{\"ok\": true, \"enabled\": true, \"already_connected\": true, "
+                   "\"hint\": \"手机已经连着，可以直接发按键\"}";
+        }
+        enabled_ = true;
+        if (adv_running_) {
+            return "{\"ok\": true, \"enabled\": true, \"advertising\": true, "
+                   "\"hint\": \"正在广播，等待 iPhone 连接（配对码 123456）\"}";
+        }
+        if (!adv_data_set_) {
+            return "{\"ok\": false, \"error\": \"广播数据还没准备好，请稍后再试\"}";
+        }
+        esp_err_t ret = esp_ble_gap_start_advertising(&adv_params_);
+        ESP_LOGI(PHONE_HID_TAG, "语音连接：开广播 ret=%s", esp_err_to_name(ret));
+        if (ret != ESP_OK) {
+            return std::string("{\"ok\": false, \"error\": \"") + esp_err_to_name(ret) + "\"}";
+        }
+        return "{\"ok\": true, \"enabled\": true, \"advertising\": true, "
+               "\"hint\": \"已开始广播 XiaoZhi-Phone，iPhone 会自动回连；没连就在蓝牙设置里点一下\"}";
+    }
+
     // ---- MCP 工具 ----------------------------------------------------------
     void RegisterTools() {
         auto& mcp = McpServer::GetInstance();
@@ -391,15 +491,21 @@ private:
         mcp.AddTool(
             "self.phone.status",
             "Get the Bluetooth connection status of the phone remote. "
-            "Returns connected flag, device name and the pairing code. "
-            "Call this when the user asks 手机连上了吗 / 蓝牙状态 / 配对码是多少.",
+            "Returns enabled (whether the remote is switched on), connected, advertising, "
+            "device name and the pairing code. "
+            "Call this when the user asks 手机连上了吗 / 手机遥控开着吗 / 蓝牙状态 / 配对码是多少.",
             PropertyList(), [this](const PropertyList&) -> ReturnValue {
-                char json[192];
+                char json[256];
+                const char* hint = enabled_
+                    ? "Open iPhone Settings > Bluetooth, connect XiaoZhi-Phone, code 123456"
+                    : "Remote is OFF. Say 连上手机 to switch it back on";
                 snprintf(json, sizeof(json),
-                         "{\"connected\": %s, \"device_name\": \"%s\", "
-                         "\"pairing_code\": \"%s\", "
-                         "\"hint\": \"Open iPhone Settings > Bluetooth, connect XiaoZhi-Phone, enter code 123456\"}",
-                         IsConnected() ? "true" : "false", PHONE_HID_NAME, PairingCode());
+                         "{\"enabled\": %s, \"connected\": %s, \"advertising\": %s, "
+                         "\"device_name\": \"%s\", \"pairing_code\": \"%s\", \"hint\": \"%s\"}",
+                         enabled_ ? "true" : "false",
+                         IsConnected() ? "true" : "false",
+                         adv_running_ ? "true" : "false",
+                         PHONE_HID_NAME, PairingCode(), hint);
                 return std::string(json);
             });
 
@@ -415,8 +521,8 @@ private:
                 Property("repeat", kPropertyTypeInteger, 1, 1, 10),
             }),
             [this](const PropertyList& properties) -> ReturnValue {
-                if (!IsConnected()) {
-                    return std::string("手机蓝牙还没连上。请在 iPhone 设置-蓝牙中连接 XiaoZhi-Phone，配对码 123456");
+                if (!CanControl()) {
+                    return std::string("手机遥控已关闭或手机没连上。说「连上手机」开启；首次配对请在 iPhone 设置-蓝牙中连接 XiaoZhi-Phone，配对码 123456");
                 }
                 const std::string action = properties["action"].value<std::string>();
                 const int repeat = properties["repeat"].value<int>();
@@ -451,8 +557,8 @@ private:
                 Property("combo", kPropertyTypeString, "enter").SetMaxLength(32),
             }),
             [this](const PropertyList& properties) -> ReturnValue {
-                if (!IsConnected()) {
-                    return std::string("手机蓝牙还没连上，无法发送按键");
+                if (!CanControl()) {
+                    return std::string("手机遥控已关闭或手机没连上，无法发送按键。说「连上手机」开启");
                 }
                 const std::string combo = properties["combo"].value<std::string>();
 
@@ -511,8 +617,8 @@ private:
                 Property("text", kPropertyTypeString, "").SetMaxLength(120),
             }),
             [this](const PropertyList& properties) -> ReturnValue {
-                if (!IsConnected()) {
-                    return std::string("手机蓝牙还没连上，无法输入文字");
+                if (!CanControl()) {
+                    return std::string("手机遥控已关闭或手机没连上，无法输入文字。说「连上手机」开启");
                 }
                 const std::string text = properties["text"].value<std::string>();
                 size_t sent = 0;
@@ -528,7 +634,27 @@ private:
                 return std::string(json);
             });
 
-        ESP_LOGI(PHONE_HID_TAG, "手机遥控工具已注册（BLE HID）");
+        mcp.AddTool(
+            "self.phone.disconnect",
+            "Turn OFF the iPhone remote temporarily: stop BLE advertising and disconnect the "
+            "phone so it cannot receive any more HID keys. "
+            "Call this when the user says 断开手机 / 关闭手机遥控 / 别连手机了 / 不用手机遥控了 / "
+            "把手机断开 / 手机遥控关掉. Do NOT call it for media keys like pause or next track.",
+            PropertyList(), [this](const PropertyList&) -> ReturnValue {
+                return DisconnectPhone();
+            });
+
+        mcp.AddTool(
+            "self.phone.connect",
+            "Turn ON / resume the iPhone remote: start BLE advertising again so the iPhone "
+            "reconnects (no re-pairing needed). "
+            "Call this when the user says 连上手机 / 打开手机遥控 / 重新连接手机 / "
+            "开启手机遥控 / 把手机连回来. Do NOT call it for connecting WiFi.",
+            PropertyList(), [this](const PropertyList&) -> ReturnValue {
+                return ConnectPhone();
+            });
+
+        ESP_LOGI(PHONE_HID_TAG, "手机遥控工具已注册（BLE HID，含断开/重连开关）");
     }
 };
 
