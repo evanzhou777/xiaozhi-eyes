@@ -55,6 +55,9 @@ jobs:
           grep -q "PHONE_HID_ENABLED" /tmp/upstream/main/boards/bread-compact-wifi/config.h
           grep -q "static PhoneHid phone_hid" /tmp/upstream/main/boards/bread-compact-wifi/compact_wifi_board.cc
           grep -q "self.phone.media" /tmp/upstream/main/boards/common/phone_hid.h
+          grep -q "self.phone.disconnect" /tmp/upstream/main/boards/common/phone_hid.h
+          grep -q "self.phone.connect" /tmp/upstream/main/boards/common/phone_hid.h
+          grep -q "esp_ble_gap_disconnect" /tmp/upstream/main/boards/common/phone_hid.h
           grep -q "XiaoZhi-Phone" /tmp/upstream/main/boards/common/phone_hid.h
           echo "补丁已应用（含 7 条本地音效 + 蚊子守望 + BLE 手机遥控）"
 
