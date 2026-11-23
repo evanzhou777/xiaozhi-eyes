@@ -9,6 +9,7 @@
 #include "lamp_controller.h"
 #include "mosquito_detector.h"
 #include "roast_sounds.h"
+#include "phone_hid.h"
 #include "led/single_led.h"
 #include "assets/lang_config.h"
 
@@ -187,6 +188,10 @@ private:
         static LampController lamp(LAMP_GPIO);
         // 蚊子雷达：独立 ADC 采样 + 独立任务，不影响音频/显示/其他工具
         static MosquitoDetector mosquito(MOSQUITO_MIC_GPIO);
+#if PHONE_HID_ENABLED
+        // 手机遥控：BLE HID 键盘 + 媒体键，iPhone 配对后可用语音控制
+        static PhoneHid phone_hid;
+#endif
     }
 
 public:
