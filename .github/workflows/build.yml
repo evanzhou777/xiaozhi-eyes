@@ -1,9 +1,10 @@
-name: Build XiaoZhi Firmware (Eyes + Mosquito Radar)
+name: Build XiaoZhi Firmware (Eyes + Radar + Phone HID)
 
-# 用法：Actions -> Build XiaoZhi Firmware (Eyes + Mosquito Radar) -> Run workflow
+# 用法：Actions -> Build XiaoZhi Firmware (Eyes + Radar + Phone HID) -> Run workflow
 # 目标：v2.5.3（main 分支 a73e9a7e）+ 全屏大眼睛 + 蚊子雷达 + 唤醒词「你好小鑫」
 #       + BOOT 双击随机播放 7 条本地 Ogg/Opus 音效（编译进 app，不占 assets 分区）
 #       + 蚊子雷达守望模式：说「帮我盯着蚊子」后持续监测，检出即主动提醒
+#       + 手机遥控：BLE HID 键盘/媒体键，iPhone 配对后语音控制
 on:
   workflow_dispatch:
 
@@ -12,7 +13,7 @@ env:
 
 jobs:
   build:
-    name: Build bread-compact-wifi (128x32, 你好小鑫, 蚊子雷达)
+    name: Build bread-compact-wifi (128x32, 你好小鑫, 雷达 + 手机遥控)
     runs-on: ubuntu-latest
     container:
       image: espressif/idf:v6.1
@@ -31,7 +32,7 @@ jobs:
           mv "$SRC_DIR" /tmp/upstream
           grep -n 'PROJECT_VER' /tmp/upstream/CMakeLists.txt | head -2
 
-      - name: 应用补丁（大眼睛 + 蚊子雷达）
+      - name: 应用补丁（大眼睛 + 蚊子雷达 + 手机遥控）
         run: |
           set -e
           cp oled_display.cc /tmp/upstream/main/display/oled_display.cc
@@ -39,6 +40,7 @@ jobs:
           cp mosquito_detector.h /tmp/upstream/main/boards/common/mosquito_detector.h
           cp roast_sounds.h /tmp/upstream/main/boards/common/roast_sounds.h
           cp mosquito_alert.h /tmp/upstream/main/boards/common/mosquito_alert.h
+          cp phone_hid.h /tmp/upstream/main/boards/common/phone_hid.h
           cp config.h /tmp/upstream/main/boards/bread-compact-wifi/config.h
           cp compact_wifi_board.cc /tmp/upstream/main/boards/bread-compact-wifi/compact_wifi_board.cc
           grep -q "EyesForEmotion" /tmp/upstream/main/display/oled_display.cc
@@ -50,24 +52,49 @@ jobs:
           grep -q "PlayRandomRoast" /tmp/upstream/main/boards/bread-compact-wifi/compact_wifi_board.cc
           grep -q "self.mosquito.watch" /tmp/upstream/main/boards/common/mosquito_detector.h
           grep -q "MOSQUITO_ALERT_SOUND" /tmp/upstream/main/boards/common/mosquito_alert.h
-          echo "补丁已应用（含 7 条本地音效 + 蚊子守望）"
+          grep -q "PHONE_HID_ENABLED" /tmp/upstream/main/boards/bread-compact-wifi/config.h
+          grep -q "static PhoneHid phone_hid" /tmp/upstream/main/boards/bread-compact-wifi/compact_wifi_board.cc
+          grep -q "self.phone.media" /tmp/upstream/main/boards/common/phone_hid.h
+          grep -q "XiaoZhi-Phone" /tmp/upstream/main/boards/common/phone_hid.h
+          echo "补丁已应用（含 7 条本地音效 + 蚊子守望 + BLE 手机遥控）"
 
-      - name: 补上 esp_adc 组件依赖
+      - name: 补组件依赖（esp_adc / esp_hid）
         run: |
           set -e
           cd /tmp/upstream/main
           python3 - <<'PY'
           import re
           s = open('CMakeLists.txt').read()
-          if 'esp_adc' not in s:
-              m = re.search(r'idf_component_register\(', s)
-              i = s.index('PRIV_REQUIRES', m.end())
-              j = s.index('\n', i) + 1
-              s = s[:j] + '                        esp_adc\n' + s[j:]
-              open('CMakeLists.txt', 'w').write(s)
-          print('esp_adc ok')
+          m = re.search(r'idf_component_register\(', s)
+          if not m:
+              raise SystemExit('找不到 idf_component_register(')
+          i = s.index('PRIV_REQUIRES', m.end())
+          j = s.index('\n', i) + 1
+          requires_line = s[i:j]
+          # 上游已含 bt；esp_hid 提供 esp_hidd_dev_* / esp_hidd_gatts_event_handler
+          for dep in ('esp_adc', 'esp_hid'):
+              if not re.search(r'\b' + dep + r'\b', requires_line):
+                  s = s[:j] + '                        ' + dep + '\n' + s[j:]
+                  j += len(dep) + 25
+          open('CMakeLists.txt', 'w').write(s)
+          print('esp_adc + esp_hid ok')
           PY
-          grep -n "esp_adc" CMakeLists.txt
+          grep -n "esp_adc\|esp_hid" CMakeLists.txt
+
+      - name: 打开 BLE（S3 / Bluedroid）
+        run: |
+          set -e
+          cd /tmp/upstream
+          cat >> sdkconfig.defaults <<'EOF'
+
+          # ---- BLE HID for phone remote ----
+          CONFIG_BT_ENABLED=y
+          CONFIG_BT_BLUEDROID_ENABLED=y
+          CONFIG_BT_BLE_ENABLED=y
+          CONFIG_BT_BLE_42_FEATURES_SUPPORTED=y
+          CONFIG_BT_GATTS_ENABLE=y
+          EOF
+          grep -n "CONFIG_BT_" sdkconfig.defaults
 
       - name: 编译 128x32 版本
         shell: bash
@@ -84,15 +111,15 @@ jobs:
         run: |
           set -e
           mkdir -p /tmp/out
-          cp /tmp/upstream/build/merged-binary.bin /tmp/out/merged-radar-253.bin
+          cp /tmp/upstream/build/merged-binary.bin /tmp/out/merged-phone-hid.bin
           if [ -f /tmp/upstream/build/xiaozhi.bin ]; then
-            cp /tmp/upstream/build/xiaozhi.bin /tmp/out/app-radar-253.bin
+            cp /tmp/upstream/build/xiaozhi.bin /tmp/out/app-phone-hid.bin
           fi
           ls -la /tmp/out
 
       - name: 上传固件
         uses: actions/upload-artifact@v4
         with:
-          name: firmware-radar-253
+          name: firmware-phone-hid-253
           path: /tmp/out/*.bin
           if-no-files-found: error
