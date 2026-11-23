@@ -62,4 +62,10 @@
 // 不想装就把这里改成 GPIO_NUM_NC，不影响编译和小智原有功能。
 #define MOSQUITO_MIC_GPIO GPIO_NUM_1
 
+// ---- 手机遥控（BLE HID）----------------------------------------------------
+// 1 = 编译 BLE HID 设备，iPhone 通过蓝牙连上后可以用语音发按键控制手机
+// 0 = 完全禁用，不影响其他功能
+// 注意：开启后 BLE 与 WiFi 共用 2.4G，只在需要手机遥控时设为 1
+#define PHONE_HID_ENABLED 1
+
 #endif // _BOARD_CONFIG_H_
