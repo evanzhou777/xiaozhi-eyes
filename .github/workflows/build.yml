@@ -91,8 +91,12 @@ jobs:
           CONFIG_BT_ENABLED=y
           CONFIG_BT_BLUEDROID_ENABLED=y
           CONFIG_BT_BLE_ENABLED=y
-          CONFIG_BT_BLE_42_FEATURES_SUPPORTED=y
+          CONFIG_BT_BLE_50_FEATURES_SUPPORTED=y
           CONFIG_BT_GATTS_ENABLE=y
+          CONFIG_BT_GATTC_ENABLE=n
+          # 关键：BT 栈优先用 PSRAM，把内部 SRAM 让给 WiFi/TLS/MQTT
+          CONFIG_BT_ALLOCATION_FROM_SPIRAM_FIRST=y
+          CONFIG_BT_BLE_DYNAMIC_ENV_MEMORY=y
           EOF
           grep -n "CONFIG_BT_" sdkconfig.defaults
 
